@@ -48,6 +48,27 @@ If analyzing an offline image or a forensically recovered folder, specify the pa
 python pe_injection_scan.py --prefetch-dir D:\Forensics\Dumps\Prefetch
 ```
 
+### 5. Suppress Banner
+To run without the banner displayed (useful for scripting):
+
+```powershell
+python pe_injection_scan.py --no-banner
+```
+
+### 6. Disable Pause
+To disable the "Press any key to continue..." pause at the end (useful for automation):
+
+```powershell
+python pe_injection_scan.py --no-pause
+```
+
+### 7. Combine Options
+You can combine multiple options:
+
+```powershell
+python pe_injection_scan.py --no-banner --no-pause --export report.json
+```
+
 ## Building as a Portable Executable
 
 The project includes a PyInstaller .spec file configured for standalone builds. The resulting EXE includes a UAC manifest to automatically request admin privileges.
