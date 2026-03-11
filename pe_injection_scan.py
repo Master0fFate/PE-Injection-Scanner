@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
+FROZEN_EXE = getattr(sys, 'frozen', False)
+
 _STD_OUTPUT_HANDLE = -11
 _kernel32 = ctypes.windll.kernel32
 _console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
@@ -203,7 +205,7 @@ def print_progress(description: str, current: int, total: int, bar_width: int = 
 
 PREFETCH_DIR = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "Prefetch"
 SCCA_SIGNATURE = b"SCCA"
-MAM_SIGNATURE = b"MAM\x04"
+MAM_SIGNATURES = [b"MAM\x04", b"MAM\x05", b"MAM\x06"]
 FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
 HIGH_RISK_TARGETS = {
@@ -230,6 +232,12 @@ EXPECTED_PATHS = {
     "DLLHOST.EXE": ["\\WINDOWS\\SYSTEM32\\DLLHOST.EXE"],
     "CONHOST.EXE": ["\\WINDOWS\\SYSTEM32\\CONHOST.EXE"],
     "TASKHOSTW.EXE": ["\\WINDOWS\\SYSTEM32\\TASKHOSTW.EXE"],
+    "SPOTIFY.EXE": [
+        "\\PROGRAM FILES\\SPOTIFY\\SPOTIFY.EXE",
+        "\\USERS\\%LOCALAPPDATA%\\SPOTIFY\\SPOTIFY.EXE",
+    ],
+    "SEARCHPROTOCOLHOST.EXE": ["\\WINDOWS\\SYSTEM32\\SEARCHPROTOCOLHOST.EXE"],
+    "WERFAULT.EXE": ["\\WINDOWS\\SYSTEM32\\WERFAULT.EXE"],
 }
 
 
@@ -291,14 +299,17 @@ def filetime_to_datetime(ft: int) -> datetime | None:
 
 XPRESS_HUFFMAN = 0x0104
 WORKSPACE_SIZE = 65536
+MAX_PREFETCH_SIZE = 50 * 1024 * 1024  # 50 MB limit to prevent memory exhaustion
+MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024  # 256 MB max decompressed size
 
 
 def decompress_mam(data: bytes) -> bytes | None:
-    if data[:4] != MAM_SIGNATURE:
+    # Check if data starts with any known MAM signature
+    if not any(data[:4] == sig for sig in MAM_SIGNATURES):
         return None
     try:
         decompressed_size = struct.unpack_from("<I", data, 4)[0]
-        if decompressed_size == 0 or decompressed_size > 256 * 1024 * 1024:
+        if decompressed_size == 0 or decompressed_size > MAX_DECOMPRESSED_SIZE:
             return None
         compressed_data = data[8:]
         output_buffer = ctypes.create_string_buffer(decompressed_size)
@@ -427,17 +438,20 @@ def parse_prefetch_file(filepath: Path) -> PrefetchEntry | None:
     except (PermissionError, OSError):
         return None
 
+    if len(raw_data) > MAX_PREFETCH_SIZE:
+        return None
+
     if len(raw_data) < 16:
         return None
 
     data = raw_data
-    if raw_data[:4] == MAM_SIGNATURE:
+    if raw_data[:4] in MAM_SIGNATURES:
         decompressed = decompress_mam(raw_data)
         if decompressed is None:
             return None
         data = decompressed
 
-    if len(data) < 84:
+    if len(data) < 108:
         return None
 
     version = struct.unpack_from("<I", data, 0)[0]
@@ -447,6 +461,11 @@ def parse_prefetch_file(filepath: Path) -> PrefetchEntry | None:
         return None
 
     if version not in (17, 23, 26, 30):
+        return None
+
+    # Validate minimum required size for version
+    min_size = {17: 100, 23: 152, 26: 176, 30: 208}
+    if len(data) < min_size.get(version, 200):
         return None
 
     try:
@@ -460,14 +479,19 @@ def parse_prefetch_file(filepath: Path) -> PrefetchEntry | None:
 
     prefetch_hash = struct.unpack_from("<I", data, 76)[0]
 
-    if len(data) < 108 and version != 17:
-        return None
-    if version == 17 and len(data) < 100:
-        return None
-
+    # Validate offsets are within bounds
     metrics_offset = struct.unpack_from("<I", data, 84)[0]
     metrics_count = struct.unpack_from("<I", data, 88)[0]
     strings_offset = struct.unpack_from("<I", data, 100)[0]
+    
+    # Bounds check: ensure offsets don't exceed data length
+    max_offset = max(metrics_offset, strings_offset)
+    if max_offset > len(data):
+        return None
+    
+    # Sanity check on metrics count
+    if metrics_count > 1000:  # Reasonable upper limit
+        return None
 
     process_path, file_references = resolve_process_path(
         data, executable_name, metrics_offset, metrics_count, strings_offset, version
@@ -545,7 +569,9 @@ def evaluate_entry(entry: PrefetchEntry) -> Finding:
         exe_upper = entry.executable_name.upper()
         path_upper = entry.process_path.upper()
         expected = EXPECTED_PATHS.get(exe_upper, [])
-        path_valid = any(ep in path_upper for ep in expected) if expected else True
+        path_valid = any(
+            path_upper.endswith(ep.upper()) for ep in expected
+        ) if expected else True
         if not path_valid:
             severity = Severity.HIGH
             reasons.append(
@@ -737,10 +763,26 @@ def display_banner() -> None:
 
 
 def _pause() -> None:
-    if not sys.stdout.isatty():
+    # For frozen EXE, use os.system("pause")
+    if FROZEN_EXE:
+        os.system("pause >nul")
         return
-    cprint("  Press any key to continue...", _DIM_WHITE)
-    _ = msvcrt.getch()
+    
+    # For Python scripts, always try to pause
+    # Try msvcrt first (Windows)
+    try:
+        import msvcrt
+        cprint("  Press any key to continue...", _DIM_WHITE)
+        msvcrt.getch()
+        return
+    except (ImportError, AttributeError):
+        pass
+    
+    # Try input() as fallback for cross-platform
+    try:
+        input("  Press Enter to continue...")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 def main() -> None:
@@ -768,6 +810,11 @@ def main() -> None:
         "--no-banner",
         action="store_true",
         help="Suppress the startup banner",
+    )
+    parser.add_argument(
+        "--no-pause",
+        action="store_true",
+        help="Disable the pause at the end of execution",
     )
     args = parser.parse_args()
 
@@ -809,7 +856,8 @@ def main() -> None:
         export_results(entries, findings, args.export)
 
     print()
-    _pause()
+    if not args.no_pause:
+        _pause()
 
 
 if __name__ == "__main__":
