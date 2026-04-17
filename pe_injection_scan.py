@@ -1,7 +1,6 @@
 import argparse
 import ctypes
 import json
-import msvcrt
 import struct
 import sys
 import os
@@ -11,10 +10,11 @@ from enum import Enum
 from pathlib import Path
 
 FROZEN_EXE = getattr(sys, 'frozen', False)
+IS_WINDOWS = sys.platform == "win32"
 
 _STD_OUTPUT_HANDLE = -11
-_kernel32 = ctypes.windll.kernel32
-_console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
+_kernel32 = ctypes.windll.kernel32 if IS_WINDOWS else None
+_console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE) if _kernel32 else None
 
 _BLACK   = 0x0000
 _BLUE    = 0x0001
@@ -44,20 +44,27 @@ class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
         ("dwMaximumWindowSize", ctypes.c_short * 2),
     ]
 
-_csbi = _CONSOLE_SCREEN_BUFFER_INFO()
-_kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(_csbi))
-_ORIGINAL_ATTRS = _csbi.wAttributes
+if _kernel32 and _console_handle:
+    _csbi = _CONSOLE_SCREEN_BUFFER_INFO()
+    _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(_csbi))
+    _ORIGINAL_ATTRS = _csbi.wAttributes
+else:
+    _ORIGINAL_ATTRS = _DEFAULT_COLOR
 
 
 def _set_color(color: int) -> None:
-    _kernel32.SetConsoleTextAttribute(_console_handle, color)
+    if _kernel32 and _console_handle:
+        _kernel32.SetConsoleTextAttribute(_console_handle, color)
 
 
 def _reset_color() -> None:
-    _kernel32.SetConsoleTextAttribute(_console_handle, _ORIGINAL_ATTRS)
+    if _kernel32 and _console_handle:
+        _kernel32.SetConsoleTextAttribute(_console_handle, _ORIGINAL_ATTRS)
 
 
 def _get_terminal_width() -> int:
+    if not (_kernel32 and _console_handle):
+        return 120
     try:
         info = _CONSOLE_SCREEN_BUFFER_INFO()
         _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(info))
