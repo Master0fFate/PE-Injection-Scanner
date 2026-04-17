@@ -13,7 +13,10 @@ FROZEN_EXE = getattr(sys, 'frozen', False)
 IS_WINDOWS = sys.platform == "win32"
 
 _STD_OUTPUT_HANDLE = -11
-_kernel32 = ctypes.windll.kernel32 if IS_WINDOWS and hasattr(ctypes, "windll") else None
+try:
+    _kernel32 = ctypes.windll.kernel32 if IS_WINDOWS else None
+except AttributeError:
+    _kernel32 = None
 _console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE) if _kernel32 else None
 
 _BLACK   = 0x0000
