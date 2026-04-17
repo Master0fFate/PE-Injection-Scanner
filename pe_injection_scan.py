@@ -10,11 +10,13 @@ from enum import Enum
 from pathlib import Path
 
 FROZEN_EXE = getattr(sys, 'frozen', False)
-_is_windows = sys.platform == "win32"
 
 _STD_OUTPUT_HANDLE = -11
-if _is_windows:
-    _kernel32 = ctypes.windll.kernel32
+if sys.platform == "win32":
+    try:
+        _kernel32 = ctypes.windll.kernel32
+    except (AttributeError, OSError):
+        _kernel32 = None
 else:
     _kernel32 = None
 
