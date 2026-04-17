@@ -21,7 +21,7 @@ else:
 if _kernel32:
     try:
         _console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
-    except (OSError, AttributeError, ctypes.ArgumentError):
+    except (OSError, AttributeError):
         _console_handle = None
 else:
     _console_handle = None
@@ -81,7 +81,7 @@ def _get_terminal_width() -> int:
         _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(info))
         width = info.srWindow[2] - info.srWindow[0] + 1
         return max(width, 80)
-    except (OSError, AttributeError, ctypes.ArgumentError):
+    except (OSError, AttributeError):
         return _DEFAULT_TERMINAL_WIDTH
 
 
