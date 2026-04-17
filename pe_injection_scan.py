@@ -1,7 +1,6 @@
 import argparse
 import ctypes
 import json
-import msvcrt
 import struct
 import sys
 import os
@@ -13,8 +12,21 @@ from pathlib import Path
 FROZEN_EXE = getattr(sys, 'frozen', False)
 
 _STD_OUTPUT_HANDLE = -11
-_kernel32 = ctypes.windll.kernel32
-_console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
+if sys.platform == "win32":
+    try:
+        _kernel32 = ctypes.windll.kernel32
+    except (AttributeError, OSError):
+        _kernel32 = None
+else:
+    _kernel32 = None
+
+if _kernel32:
+    try:
+        _console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
+    except (OSError, AttributeError):
+        _console_handle = None
+else:
+    _console_handle = None
 
 _BLACK   = 0x0000
 _BLUE    = 0x0001
@@ -34,6 +46,8 @@ _BRIGHT_CYAN   = _CYAN | _INTENSE
 _DIM_WHITE     = _WHITE
 
 _DEFAULT_COLOR = _WHITE
+_DEFAULT_TERMINAL_WIDTH = 120
+_MIN_TERMINAL_WIDTH = 80
 
 class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
     _fields_ = [
@@ -44,27 +58,34 @@ class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
         ("dwMaximumWindowSize", ctypes.c_short * 2),
     ]
 
-_csbi = _CONSOLE_SCREEN_BUFFER_INFO()
-_kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(_csbi))
-_ORIGINAL_ATTRS = _csbi.wAttributes
+if _kernel32 and _console_handle:
+    _csbi = _CONSOLE_SCREEN_BUFFER_INFO()
+    _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(_csbi))
+    _ORIGINAL_ATTRS = _csbi.wAttributes
+else:
+    _ORIGINAL_ATTRS = _DEFAULT_COLOR
 
 
 def _set_color(color: int) -> None:
-    _kernel32.SetConsoleTextAttribute(_console_handle, color)
+    if _kernel32 and _console_handle:
+        _kernel32.SetConsoleTextAttribute(_console_handle, color)
 
 
 def _reset_color() -> None:
-    _kernel32.SetConsoleTextAttribute(_console_handle, _ORIGINAL_ATTRS)
+    if _kernel32 and _console_handle:
+        _kernel32.SetConsoleTextAttribute(_console_handle, _ORIGINAL_ATTRS)
 
 
 def _get_terminal_width() -> int:
+    if not (_kernel32 and _console_handle):
+        return _DEFAULT_TERMINAL_WIDTH
     try:
         info = _CONSOLE_SCREEN_BUFFER_INFO()
         _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(info))
         width = info.srWindow[2] - info.srWindow[0] + 1
-        return max(width, 80)
-    except Exception:
-        return 120
+        return max(width, _MIN_TERMINAL_WIDTH)
+    except (OSError, AttributeError):
+        return _DEFAULT_TERMINAL_WIDTH
 
 
 def cprint(text: str, color: int = _DEFAULT_COLOR, end: str = "\n") -> None:
