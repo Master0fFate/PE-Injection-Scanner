@@ -10,10 +10,10 @@ from enum import Enum
 from pathlib import Path
 
 FROZEN_EXE = getattr(sys, 'frozen', False)
-IS_WINDOWS = sys.platform == "win32"
+_is_windows = sys.platform == "win32"
 
 _STD_OUTPUT_HANDLE = -11
-if IS_WINDOWS:
+if _is_windows:
     _kernel32 = ctypes.windll.kernel32
 else:
     _kernel32 = None
@@ -45,6 +45,7 @@ _DIM_WHITE     = _WHITE
 
 _DEFAULT_COLOR = _WHITE
 _DEFAULT_TERMINAL_WIDTH = 120
+_MIN_TERMINAL_WIDTH = 80
 
 class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
     _fields_ = [
@@ -80,7 +81,7 @@ def _get_terminal_width() -> int:
         info = _CONSOLE_SCREEN_BUFFER_INFO()
         _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(info))
         width = info.srWindow[2] - info.srWindow[0] + 1
-        return max(width, 80)
+        return max(width, _MIN_TERMINAL_WIDTH)
     except (OSError, AttributeError):
         return _DEFAULT_TERMINAL_WIDTH
 
