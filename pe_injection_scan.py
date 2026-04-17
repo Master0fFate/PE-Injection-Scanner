@@ -14,17 +14,14 @@ IS_WINDOWS = sys.platform == "win32"
 
 _STD_OUTPUT_HANDLE = -11
 if IS_WINDOWS:
-    try:
-        _kernel32 = ctypes.windll.kernel32
-    except AttributeError:
-        _kernel32 = None
+    _kernel32 = ctypes.windll.kernel32
 else:
     _kernel32 = None
 
 if _kernel32:
     try:
         _console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
-    except Exception:
+    except (OSError, AttributeError, ctypes.ArgumentError):
         _console_handle = None
 else:
     _console_handle = None
@@ -84,7 +81,7 @@ def _get_terminal_width() -> int:
         _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(info))
         width = info.srWindow[2] - info.srWindow[0] + 1
         return max(width, 80)
-    except Exception:
+    except (OSError, AttributeError, ctypes.ArgumentError):
         return _DEFAULT_TERMINAL_WIDTH
 
 
