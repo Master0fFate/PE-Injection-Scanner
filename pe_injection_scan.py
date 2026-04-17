@@ -13,7 +13,7 @@ FROZEN_EXE = getattr(sys, 'frozen', False)
 IS_WINDOWS = sys.platform == "win32"
 
 _STD_OUTPUT_HANDLE = -11
-_kernel32 = ctypes.windll.kernel32 if IS_WINDOWS else None
+_kernel32 = ctypes.windll.kernel32 if IS_WINDOWS and hasattr(ctypes, "windll") else None
 _console_handle = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE) if _kernel32 else None
 
 _BLACK   = 0x0000
@@ -34,6 +34,7 @@ _BRIGHT_CYAN   = _CYAN | _INTENSE
 _DIM_WHITE     = _WHITE
 
 _DEFAULT_COLOR = _WHITE
+_DEFAULT_TERMINAL_WIDTH = 120
 
 class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
     _fields_ = [
@@ -64,14 +65,14 @@ def _reset_color() -> None:
 
 def _get_terminal_width() -> int:
     if not (_kernel32 and _console_handle):
-        return 120
+        return _DEFAULT_TERMINAL_WIDTH
     try:
         info = _CONSOLE_SCREEN_BUFFER_INFO()
         _kernel32.GetConsoleScreenBufferInfo(_console_handle, ctypes.byref(info))
         width = info.srWindow[2] - info.srWindow[0] + 1
         return max(width, 80)
     except Exception:
-        return 120
+        return _DEFAULT_TERMINAL_WIDTH
 
 
 def cprint(text: str, color: int = _DEFAULT_COLOR, end: str = "\n") -> None:
