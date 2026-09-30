@@ -361,14 +361,16 @@ def decompress_mam(data: bytes) -> bytes:
     if not 0 < fragment_size.value <= MAX_DECOMPRESSED_SIZE:
         raise PrefetchError("Invalid decompression workspace size")
     workspace = ctypes.create_string_buffer(fragment_size.value)
-    output = ctypes.create_string_buffer(size)
+    # Native XPRESS may return success after filling an undersized buffer.
+    # One sentinel byte of capacity exposes truncated advertised lengths.
+    output = ctypes.create_string_buffer(size + 1)
     compressed = ctypes.create_string_buffer(data[payload_offset:])
     final_size = ctypes.c_ulong()
     decompress = ntdll.RtlDecompressBufferEx
     decompress.argtypes = [ctypes.c_ushort, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
                            ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
     decompress.restype = ctypes.c_long
-    status = decompress(XPRESS_HUFFMAN, output, size, compressed, len(data) - payload_offset,
+    status = decompress(XPRESS_HUFFMAN, output, size + 1, compressed, len(data) - payload_offset,
                         ctypes.byref(final_size), workspace)
     if status != 0 or final_size.value != size:
         raise PrefetchError("MAM decompression failed or output length mismatched")

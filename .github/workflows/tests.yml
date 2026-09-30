@@ -20,3 +20,22 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python -m compileall -q pe_injection_scan.py sysmon_evidence.py
       - run: python pe_injection_scan.py --help
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install pyinstaller==6.16.0
+      - run: python -m PyInstaller --clean --noconfirm PE_INJECTION_SCAN.spec
+      - run: python scripts/smoke_executable.py dist/pe_injection_scan.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pe-injection-scanner-windows-${{ github.sha }}
+          path: |
+            dist/pe_injection_scan.exe
+            dist/pe_injection_scan.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
