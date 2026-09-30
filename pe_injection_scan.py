@@ -4,6 +4,10 @@ import json
 import struct
 import sys
 import os
+import hashlib
+import ntpath
+import zlib
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -88,9 +92,14 @@ def _get_terminal_width() -> int:
         return _DEFAULT_TERMINAL_WIDTH
 
 
+def _console_safe(text: str) -> str:
+    text = text.encode(sys.stdout.encoding or "utf-8", errors="backslashreplace").decode(sys.stdout.encoding or "utf-8")
+    return "".join(char if (char in "\n\t" or ord(char) >= 32) and not 0xD800 <= ord(char) <= 0xDFFF and ord(char) != 127 else f"\\u{ord(char):04x}" for char in text)
+
+
 def cprint(text: str, color: int = _DEFAULT_COLOR, end: str = "\n") -> None:
     _set_color(color)
-    sys.stdout.write(text)
+    sys.stdout.write(_console_safe(text))
     sys.stdout.write(end)
     sys.stdout.flush()
     _reset_color()
@@ -99,7 +108,7 @@ def cprint(text: str, color: int = _DEFAULT_COLOR, end: str = "\n") -> None:
 def cprint_multi(segments: list[tuple[str, int]], end: str = "\n") -> None:
     for text, color in segments:
         _set_color(color)
-        sys.stdout.write(text)
+        sys.stdout.write(_console_safe(text))
         sys.stdout.flush()
     _reset_color()
     sys.stdout.write(end)
@@ -226,21 +235,8 @@ def print_progress(description: str, current: int, total: int, bar_width: int = 
 
 PREFETCH_DIR = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "Prefetch"
 SCCA_SIGNATURE = b"SCCA"
-MAM_SIGNATURES = [b"MAM\x04", b"MAM\x05", b"MAM\x06"]
+MAM_SIGNATURES = [b"MAM\x04", b"MAM\x84"]
 FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
-
-HIGH_RISK_TARGETS = {
-    "RUNTIMEBROKER.EXE",
-    "CTFMON.EXE",
-    "SVCHOST.EXE",
-    "NOTEPAD.EXE",
-    "SPOTIFY.EXE",
-    "DLLHOST.EXE",
-    "CONHOST.EXE",
-    "SEARCHPROTOCOLHOST.EXE",
-    "WERFAULT.EXE",
-    "TASKHOSTW.EXE",
-}
 
 EXPECTED_PATHS = {
     "RUNTIMEBROKER.EXE": ["\\WINDOWS\\SYSTEM32\\RUNTIMEBROKER.EXE"],
@@ -267,7 +263,7 @@ class Severity(Enum):
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
-    CLEAN = "CLEAN"
+    CLEAN = "NO_ANOMALY"
 
 
 SEVERITY_COLORS = {
@@ -293,6 +289,11 @@ class PrefetchEntry:
     created: datetime | None
     modified: datetime | None
     source_path: str
+    source_sha256: str = ""
+    last_runs: list[datetime] = field(default_factory=list)
+    last_run_filetimes: list[int] = field(default_factory=list)
+    path_candidates: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -300,6 +301,8 @@ class Finding:
     entry: PrefetchEntry
     severity: Severity
     reasons: list[str] = field(default_factory=list)
+    confidence: str = "low"
+    evidence_type: str = "prefetch_heuristic"
 
 
 def is_admin() -> bool:
@@ -318,325 +321,198 @@ def filetime_to_datetime(ft: int) -> datetime | None:
         return None
 
 
-XPRESS_HUFFMAN = 0x0104
-WORKSPACE_SIZE = 65536
-MAX_PREFETCH_SIZE = 50 * 1024 * 1024  # 50 MB limit to prevent memory exhaustion
-MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024  # 256 MB max decompressed size
+XPRESS_HUFFMAN = 4
+MAX_PREFETCH_SIZE = 50 * 1024 * 1024
+MAX_DECOMPRESSED_SIZE = 64 * 1024 * 1024
+MAX_METRICS = 50_000
+MAX_REFERENCE_CHARS = 32_768
+MAX_REFERENCE_BYTES = 16 * 1024 * 1024
+LIMITATION = "Prefetch anomalies are triage clues, not proof of injection or hollowing; absence of findings does not establish a clean host."
 
 
-def decompress_mam(data: bytes) -> bytes | None:
-    # Check if data starts with any known MAM signature
-    if not any(data[:4] == sig for sig in MAM_SIGNATURES):
-        return None
+class PrefetchError(ValueError):
+    """Unsupported, incomplete, or malformed evidence."""
+
+
+def decompress_mam(data: bytes) -> bytes:
+    if len(data) < 8 or data[:4] not in MAM_SIGNATURES:
+        raise PrefetchError("Unsupported MAM variant (expected MAM04 or MAM84)")
+    payload_offset = 8
+    if data[3] == 0x84:
+        if len(data) < 12:
+            raise PrefetchError("Truncated MAM checksum header")
+        expected_crc = struct.unpack_from("<I", data, 8)[0]
+        actual_crc = zlib.crc32(data[:8] + bytes(4) + data[12:]) & 0xffffffff
+        if expected_crc != actual_crc:
+            raise PrefetchError("MAM checksum mismatch")
+        payload_offset = 12
+    size = struct.unpack_from("<I", data, 4)[0]
+    if not 0 < size <= MAX_DECOMPRESSED_SIZE:
+        raise PrefetchError("Invalid or oversized decompression length")
+    if sys.platform != "win32":
+        raise PrefetchError("MAM decompression requires Windows; use an uncompressed evidence copy")
+    ntdll = ctypes.WinDLL("ntdll")
+    workspace_size, fragment_size = ctypes.c_ulong(), ctypes.c_ulong()
+    get_size = ntdll.RtlGetCompressionWorkSpaceSize
+    get_size.argtypes = [ctypes.c_ushort, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong)]
+    get_size.restype = ctypes.c_long
+    if get_size(XPRESS_HUFFMAN, ctypes.byref(workspace_size), ctypes.byref(fragment_size)) != 0:
+        raise PrefetchError("Could not query decompression workspace")
+    if not 0 < fragment_size.value <= MAX_DECOMPRESSED_SIZE:
+        raise PrefetchError("Invalid decompression workspace size")
+    workspace = ctypes.create_string_buffer(fragment_size.value)
+    output = ctypes.create_string_buffer(size)
+    compressed = ctypes.create_string_buffer(data[payload_offset:])
+    final_size = ctypes.c_ulong()
+    decompress = ntdll.RtlDecompressBufferEx
+    decompress.argtypes = [ctypes.c_ushort, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                           ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+    decompress.restype = ctypes.c_long
+    status = decompress(XPRESS_HUFFMAN, output, size, compressed, len(data) - payload_offset,
+                        ctypes.byref(final_size), workspace)
+    if status != 0 or final_size.value != size:
+        raise PrefetchError("MAM decompression failed or output length mismatched")
+    return output.raw[:size]
+
+
+def _span(data: bytes, offset: int, length: int, label: str) -> bytes:
+    if offset < 0 or length < 0 or offset > len(data) or length > len(data) - offset:
+        raise PrefetchError(f"{label} extends beyond file")
+    return data[offset:offset + length]
+
+
+def _utf16(data: bytes, label: str) -> str:
     try:
-        decompressed_size = struct.unpack_from("<I", data, 4)[0]
-        if decompressed_size == 0 or decompressed_size > MAX_DECOMPRESSED_SIZE:
-            return None
-        compressed_data = data[8:]
-        output_buffer = ctypes.create_string_buffer(decompressed_size)
-        workspace = ctypes.create_string_buffer(WORKSPACE_SIZE)
-        final_size = ctypes.c_ulong(0)
-        ntdll = ctypes.windll.ntdll
-
-        status = ntdll.RtlDecompressBufferEx(
-            ctypes.c_ushort(XPRESS_HUFFMAN),
-            output_buffer,
-            ctypes.c_ulong(decompressed_size),
-            ctypes.c_char_p(compressed_data),
-            ctypes.c_ulong(len(compressed_data)),
-            ctypes.byref(final_size),
-            workspace,
-        )
-        if status == 0:
-            return output_buffer.raw[: final_size.value]
-
-        final_size = ctypes.c_ulong(0)
-        status = ntdll.RtlDecompressBuffer(
-            ctypes.c_ushort(XPRESS_HUFFMAN),
-            output_buffer,
-            ctypes.c_ulong(decompressed_size),
-            ctypes.c_char_p(compressed_data),
-            ctypes.c_ulong(len(compressed_data)),
-            ctypes.byref(final_size),
-        )
-        if status == 0:
-            return output_buffer.raw[: final_size.value]
-
-        return None
-    except (OSError, Exception):
-        return None
+        return data.decode("utf-16-le", errors="surrogatepass")
+    except UnicodeError as exc:
+        raise PrefetchError(f"Invalid UTF-16 in {label}") from exc
 
 
-def extract_filename_strings(data: bytes, offset: int, length: int) -> list[str]:
-    results = []
-    if offset + length > len(data) or length == 0:
-        return results
-    raw = data[offset : offset + length]
-    try:
-        decoded = raw.decode("utf-16-le", errors="ignore")
-    except Exception:
-        return results
-    for part in decoded.split("\x00"):
-        cleaned = part.strip()
-        if cleaned:
-            results.append(cleaned)
-    return results
-
-
-def resolve_process_path(
-    data: bytes,
-    executable_name: str,
-    metrics_offset: int,
-    metrics_count: int,
-    strings_offset: int,
-    version: int,
-) -> tuple[str, list[str]]:
-    all_refs = []
-    process_path = ""
-
-    if version == 17:
-        entry_size = 20
-    else:
-        entry_size = 32
-
-    for i in range(metrics_count):
-        entry_offset = metrics_offset + (i * entry_size)
-        if entry_offset + entry_size > len(data):
-            break
-
-        if entry_offset + 12 > len(data):
-            break
-        name_offset, name_chars = struct.unpack_from("<II", data, entry_offset + 4)
-
-        abs_offset = strings_offset + name_offset
-        byte_length = name_chars * 2
-
-        if abs_offset + byte_length > len(data) or byte_length == 0:
-            continue
-
-        try:
-            ref_path = data[abs_offset : abs_offset + byte_length].decode(
-                "utf-16-le", errors="ignore"
-            ).rstrip("\x00")
-        except Exception:
-            continue
-
-        if ref_path:
-            all_refs.append(ref_path)
-            if (
-                not process_path
-                and executable_name.upper() in ref_path.upper()
-                and ref_path.upper().endswith(executable_name.upper())
-            ):
-                process_path = ref_path
-
-    if not process_path:
-        strings_section_len = 0
-        if metrics_count > 0:
-            last_entry = metrics_offset + (metrics_count * entry_size)
-            if strings_offset > last_entry:
-                strings_section_len = min(len(data) - strings_offset, 65536)
-        if strings_section_len == 0:
-            strings_section_len = min(len(data) - strings_offset, 65536)
-
-        all_strings = extract_filename_strings(data, strings_offset, strings_section_len)
-        for s in all_strings:
-            if s not in all_refs:
-                all_refs.append(s)
-            if (
-                not process_path
-                and executable_name.upper() in s.upper()
-                and s.upper().endswith(executable_name.upper())
-            ):
-                process_path = s
-
-    return process_path, all_refs
-
-
-def parse_prefetch_file(filepath: Path) -> PrefetchEntry | None:
-    try:
-        raw_data = filepath.read_bytes()
-    except (PermissionError, OSError):
-        return None
-
-    if len(raw_data) > MAX_PREFETCH_SIZE:
-        return None
-
-    if len(raw_data) < 16:
-        return None
-
-    data = raw_data
-    if raw_data[:4] in MAM_SIGNATURES:
-        decompressed = decompress_mam(raw_data)
-        if decompressed is None:
-            return None
-        data = decompressed
-
-    if len(data) < 108:
-        return None
-
-    version = struct.unpack_from("<I", data, 0)[0]
-    signature = data[4:8]
-
+def parse_prefetch_file(filepath: Path) -> PrefetchEntry:
+    # Bounded read, including files that change after stat; never load an unbounded file.
+    with filepath.open("rb") as stream:
+        raw = stream.read(MAX_PREFETCH_SIZE + 1)
+    if len(raw) > MAX_PREFETCH_SIZE:
+        raise PrefetchError("Input exceeds size limit")
+    data = decompress_mam(raw) if raw.startswith(b"MAM") else raw
+    _span(data, 0, 84, "header")
+    version, signature = struct.unpack_from("<I4s", data)
     if signature != SCCA_SIGNATURE:
-        return None
-
-    if version not in (17, 23, 26, 30):
-        return None
-
-    # Validate minimum required size for version
-    min_size = {17: 100, 23: 152, 26: 176, 30: 208}
-    if len(data) < min_size.get(version, 200):
-        return None
-
-    try:
-        exe_name_raw = data[16:76]
-        executable_name = exe_name_raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
-    except Exception:
-        return None
-
-    if not executable_name:
-        return None
-
-    prefetch_hash = struct.unpack_from("<I", data, 76)[0]
-
-    # Validate offsets are within bounds
-    metrics_offset = struct.unpack_from("<I", data, 84)[0]
-    metrics_count = struct.unpack_from("<I", data, 88)[0]
-    strings_offset = struct.unpack_from("<I", data, 100)[0]
-    
-    # Bounds check: ensure offsets don't exceed data length
-    max_offset = max(metrics_offset, strings_offset)
-    if max_offset > len(data):
-        return None
-    
-    # Sanity check on metrics count
-    if metrics_count > 1000:  # Reasonable upper limit
-        return None
-
-    process_path, file_references = resolve_process_path(
-        data, executable_name, metrics_offset, metrics_count, strings_offset, version
-    )
-
-    run_count = 0
-    last_run_ft = 0
-
-    try:
-        if version == 17:
-            if len(data) >= 0x78 + 4:
-                run_count = struct.unpack_from("<I", data, 0x78)[0]
-            if len(data) >= 0x78 + 8:
-                last_run_ft = struct.unpack_from("<Q", data, 0x80)[0]
-        elif version == 23:
-            if len(data) >= 0x80 + 8:
-                last_run_ft = struct.unpack_from("<Q", data, 0x80)[0]
-            if len(data) >= 0x98 + 4:
-                run_count = struct.unpack_from("<I", data, 0x98)[0]
-        elif version == 26:
-            if len(data) >= 0x80 + 8:
-                last_run_ft = struct.unpack_from("<Q", data, 0x80)[0]
-            if len(data) >= 0xB0 + 4:
-                run_count = struct.unpack_from("<I", data, 0xB0)[0]
-        elif version == 30:
-            if len(data) >= 0x80 + 8:
-                last_run_ft = struct.unpack_from("<Q", data, 0x80)[0]
-            if len(data) >= 0xD0 + 4:
-                run_count = struct.unpack_from("<I", data, 0xD0)[0]
-    except struct.error:
-        pass
-
-    last_run = filetime_to_datetime(last_run_ft)
-
-    created = None
-    modified = None
-    try:
-        stat = filepath.stat()
-        created = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
-        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-    except OSError:
-        pass
-
+        raise PrefetchError("Invalid SCCA signature")
+    # Layout sources and support boundaries are documented in docs/evidence-model.md.
+    layouts = {17: (152, 20, 8, 120, 1, 144),
+               23: (240, 32, 12, 128, 1, 152),
+               26: (304, 32, 12, 128, 8, 208),
+               30: (304, 32, 12, 128, 8, 208),
+               31: (296, 32, 12, 128, 8, 200)}
+    if version not in layouts:
+        raise PrefetchError(f"Unsupported Prefetch version {version}")
+    if version in (30, 31):
+        _span(data, 84, 4, "metrics offset")
+        metric_start = struct.unpack_from("<I", data, 84)[0]
+        if metric_start == 296:
+            layouts[version] = (296, 32, 12, 128, 8, 200)
+        elif version == 31 or metric_start != 304:
+            raise PrefetchError("Unsupported v30/v31 file information layout")
+    minimum, metric_size, name_field, time_offset, time_count, count_offset = layouts[version]
+    _span(data, 0, minimum, "file information")
+    declared_size = struct.unpack_from("<I", data, 12)[0]
+    if declared_size != len(data):
+        raise PrefetchError("Declared file size does not match decompressed length")
+    executable = _utf16(data[16:76], "executable name").split("\x00", 1)[0]
+    if not executable or ntpath.basename(executable) != executable:
+        raise PrefetchError("Missing or invalid executable name")
+    metrics_offset, metrics_count = struct.unpack_from("<II", data, 84)
+    strings_offset, strings_size = struct.unpack_from("<II", data, 100)
+    if metrics_offset < minimum or strings_offset < minimum:
+        raise PrefetchError("Section overlaps header or file information")
+    if metrics_count > MAX_METRICS:
+        raise PrefetchError("Metric count exceeds analysis budget")
+    _span(data, metrics_offset, metrics_count * metric_size, "metrics section")
+    strings = _span(data, strings_offset, strings_size, "filename strings section")
+    if strings_offset < metrics_offset + metrics_count * metric_size:
+        raise PrefetchError("Filename strings overlap metrics")
+    if strings_size % 2:
+        raise PrefetchError("Odd filename strings length")
+    refs, seen_refs = [], set()
+    decoded_bytes = 0
+    for i in range(metrics_count):
+        offset, chars = struct.unpack_from("<II", data, metrics_offset + i * metric_size + name_field)
+        decoded_bytes += chars * 2
+        if chars > MAX_REFERENCE_CHARS or decoded_bytes > MAX_REFERENCE_BYTES:
+            raise PrefetchError("Filename references exceed analysis budget")
+        if offset % 2:
+            raise PrefetchError("Misaligned filename offset")
+        value = _utf16(_span(strings, offset, chars * 2, "metric filename"), "metric filename").rstrip("\x00")
+        if "\x00" in value:
+            raise PrefetchError("Embedded null in metric filename")
+        if value and value not in seen_refs:
+            seen_refs.add(value)
+            refs.append(value)
+    candidates = list(dict.fromkeys(ref for ref in refs if ntpath.basename(ref).casefold() == executable.casefold()))
+    raw_times = [struct.unpack_from("<Q", data, time_offset + i * 8)[0] for i in range(time_count)]
+    timestamps = [filetime_to_datetime(value) for value in raw_times]
+    warnings = []
+    if any(value and timestamp is None for value, timestamp in zip(raw_times, timestamps)):
+        warnings.append("Unrepresentable FILETIME retained in last_run_filetimes")
+    if len(candidates) > 1:
+        warnings.append("Multiple matching executable references; process image path is ambiguous")
+    if len(executable) == 29:
+        warnings.append("Header executable name may be truncated")
+    stat = filepath.stat()
+    # POSIX ctime is metadata change time, not creation time.
+    birth = getattr(stat, "st_birthtime", stat.st_ctime if sys.platform == "win32" else None)
     return PrefetchEntry(
-        filename=filepath.name,
-        executable_name=executable_name,
-        prefetch_hash=prefetch_hash,
-        version=version,
-        file_size=len(data),
-        process_path=process_path,
-        file_references=file_references,
-        run_count=run_count,
-        last_run=last_run,
-        created=created,
-        modified=modified,
-        source_path=str(filepath),
-    )
+        filename=filepath.name, executable_name=executable,
+        prefetch_hash=struct.unpack_from("<I", data, 76)[0], version=version,
+        file_size=len(data), process_path=candidates[0] if len(candidates) == 1 else "",
+        file_references=refs, run_count=struct.unpack_from("<I", data, count_offset)[0],
+        last_run=timestamps[0], created=datetime.fromtimestamp(birth, timezone.utc) if birth is not None else None,
+        modified=datetime.fromtimestamp(stat.st_mtime, timezone.utc), source_path=str(filepath),
+        source_sha256=hashlib.sha256(raw).hexdigest(), last_runs=[t for t in timestamps if t],
+        path_candidates=candidates, warnings=warnings, last_run_filetimes=raw_times)
 
 
 def evaluate_entry(entry: PrefetchEntry) -> Finding:
-    reasons = []
-    is_high_risk = entry.executable_name.upper() in HIGH_RISK_TARGETS
-    has_path = bool(entry.process_path.strip())
-    has_refs = len(entry.file_references) > 0
-
-    if is_high_risk and not has_path:
-        severity = Severity.CRITICAL
-        reasons.append(
-            f"{entry.executable_name} is a known injection target with no process path"
-        )
-        if not has_refs:
-            reasons.append("No file references found in prefetch data")
-
-    elif is_high_risk and has_path:
-        exe_upper = entry.executable_name.upper()
-        path_upper = entry.process_path.upper()
-        expected = EXPECTED_PATHS.get(exe_upper, [])
-        path_valid = any(
-            path_upper.endswith(ep.upper()) for ep in expected
-        ) if expected else True
-        if not path_valid:
-            severity = Severity.HIGH
-            reasons.append(
-                f"Process path does not match expected location: {entry.process_path}"
-            )
-        else:
-            severity = Severity.CLEAN
-    elif not is_high_risk and not has_path and not has_refs:
-        severity = Severity.MEDIUM
-        reasons.append("No process path or file references detected")
-    elif not is_high_risk and not has_path and has_refs:
+    reasons = list(entry.warnings)
+    severity = Severity.LOW if reasons else Severity.CLEAN
+    if not entry.process_path:
         severity = Severity.LOW
-        reasons.append("Missing process path but file references exist")
+        reasons.append("No unique matching executable reference; incomplete traces and truncated names can explain this")
     else:
-        severity = Severity.CLEAN
+        name, path = entry.executable_name.upper(), entry.process_path.replace("/", "\\").upper()
+        # Installation-dependent applications intentionally have no fixed path rule.
+        expected = EXPECTED_PATHS.get(name, []) if name not in {"NOTEPAD.EXE", "SPOTIFY.EXE"} else []
+        expected = expected + [p.replace("\\SYSTEM32\\", "\\SYSWOW64\\") for p in expected]
+        if expected and not any(path.endswith(p) for p in expected):
+            severity = Severity.MEDIUM
+            reasons.append("Executable reference differs from common Windows locations; check custom Windows roots, servicing and legitimate copies")
+    return Finding(entry, severity, reasons)
 
-    return Finding(entry=entry, severity=severity, reasons=reasons)
 
-
-def scan_prefetch_directory(prefetch_path: Path) -> tuple[list[PrefetchEntry], list[Finding]]:
-    pf_files = sorted(prefetch_path.glob("*.pf"))
-    entries = []
-    findings = []
-
-    if not pf_files:
-        return entries, findings
-
-    total = len(pf_files)
-    for idx, pf_file in enumerate(pf_files, 1):
-        entry = parse_prefetch_file(pf_file)
-        if entry:
+def scan_prefetch_directory(prefetch_path: Path, issues: list[dict] | None = None) -> tuple[list[PrefetchEntry], list[Finding]]:
+    issues = issues if issues is not None else []
+    pf_files = sorted(p for p in prefetch_path.iterdir() if p.suffix.lower() == ".pf" and p.is_file())
+    entries, findings = [], []
+    for idx, path in enumerate(pf_files, 1):
+        try:
+            entry = parse_prefetch_file(path)
+        except (OSError, ValueError, struct.error) as exc:
+            issues.append({"source_path": str(path), "error": str(exc), "status": "not_analyzed"})
+        else:
             entries.append(entry)
             finding = evaluate_entry(entry)
             if finding.severity != Severity.CLEAN:
                 findings.append(finding)
-        print_progress("Parsing prefetch files", idx, total)
-
+        if sys.stdout.isatty():
+            print_progress("Parsing prefetch files", idx, len(pf_files))
     return entries, findings
 
 
 def render_findings(findings: list[Finding]) -> None:
     if not findings:
         print_box(
-            [("  No indicators of PE injection detected.", _BRIGHT_GREEN)],
+            [("  No Prefetch heuristics flagged. This does not rule out compromise.", _BRIGHT_GREEN)],
             title="Results",
             border_color=_BRIGHT_GREEN,
         )
@@ -696,14 +572,14 @@ def render_summary(entries: list[PrefetchEntry], findings: list[Finding]) -> Non
 
     if critical_or_high > 0:
         lines.append(
-            (f"  !  {critical_or_high} high-confidence detection(s) found.", _BRIGHT_RED)
+            (f"  !  {critical_or_high} priority finding(s) require corroboration.", _BRIGHT_RED)
         )
     elif counts[Severity.MEDIUM] > 0:
         lines.append(
             ("  !  Possible indicators found. Manual review recommended.", _BRIGHT_YELLOW)
         )
     else:
-        lines.append(("  +  System appears clean.", _BRIGHT_GREEN))
+        lines.append(("  +  No higher-priority Prefetch clues. Coverage is limited.", _BRIGHT_GREEN))
 
     print_box(lines, title="Scan Summary", border_color=_BRIGHT_WHITE)
 
@@ -721,7 +597,7 @@ def render_all_entries(entries: list[PrefetchEntry], flagged_files: set[str]) ->
     for entry in sorted(entries, key=lambda e: e.executable_name):
         is_flagged = entry.filename in flagged_files
         color = _BRIGHT_RED if is_flagged else _DEFAULT_COLOR
-        status_text = "FLAGGED" if is_flagged else "OK"
+        status_text = "FLAGGED" if is_flagged else "NO FLAG"
         status_color = _BRIGHT_RED if is_flagged else _BRIGHT_GREEN
         path_display = entry.process_path if entry.process_path else "<none>"
 
@@ -741,42 +617,37 @@ def render_all_entries(entries: list[PrefetchEntry], flagged_files: set[str]) ->
     )
 
 
-def export_results(
-    entries: list[PrefetchEntry], findings: list[Finding], output_path: str
-) -> None:
+def export_results(entries: list[PrefetchEntry], findings: list[Finding], output_path: str,
+                   issues: list[dict] | None = None, sysmon: dict | None = None) -> None:
     report = {
-        "scan_time": datetime.now(tz=timezone.utc).isoformat(),
-        "total_entries": len(entries),
-        "total_findings": len(findings),
-        "findings": [
-            {
-                "severity": f.severity.value,
-                "executable": f.entry.executable_name,
-                "process_path": f.entry.process_path,
-                "run_count": f.entry.run_count,
-                "last_run": f.entry.last_run.isoformat() if f.entry.last_run else None,
-                "prefetch_file": f.entry.filename,
-                "reasons": f.reasons,
-                "file_references_count": len(f.entry.file_references),
-            }
-            for f in findings
-        ],
+        "schema_version": 2, "scan_time": datetime.now(timezone.utc).isoformat(),
+        "limitations": [LIMITATION, "Filesystem timestamps describe the evidence copy, not necessarily the original host."],
+        "total_entries": len(entries), "total_findings": len(findings),
+        "coverage": {"scope": "prefetch", "parsed": len(entries), "not_analyzed": len(issues or []),
+                     "status": "partial" if issues else ("complete_for_supplied_files" if entries else "no_prefetch_evidence")},
+        "parse_issues": issues or [],
+        "entries": [asdict(entry) for entry in entries],
+        "findings": [{"severity": f.severity.value, "confidence": f.confidence,
+                      "evidence_type": f.evidence_type, "prefetch_file": f.entry.filename,
+                      "source_path": f.entry.source_path, "source_sha256": f.entry.source_sha256,
+                      "reasons": f.reasons} for f in findings],
+        "sysmon": sysmon,
     }
-    try:
-        with open(output_path, "w", encoding="utf-8") as fp:
-            json.dump(report, fp, indent=2, ensure_ascii=False)
-        print()
-        cprint(f"  Report saved to: {output_path}", _BRIGHT_GREEN)
-    except OSError as e:
-        print()
-        cprint(f"  Failed to save report: {e}", _BRIGHT_RED)
+    def serialize(value):
+        if isinstance(value, datetime):
+            return value.isoformat()
+        raise TypeError(type(value).__name__)
+    # Exclusive creation prevents accidental overwrite of evidence or an existing report.
+    with open(output_path, "x", encoding="utf-8") as fp:
+        json.dump(report, fp, indent=2, ensure_ascii=True, default=serialize)
+    cprint(f"  Report saved to: {output_path}", _BRIGHT_GREEN)
 
 
 def display_banner() -> None:
     lines: list[str | tuple[str, int]] = [
         ("", _DEFAULT_COLOR),
-        ("    PE Injection Detector", _BRIGHT_WHITE),
-        ("    Prefetch-based process hollowing detection", _DIM_WHITE),
+        ("    PE Evidence Triage", _BRIGHT_WHITE),
+        ("    Read-only Prefetch and Sysmon evidence triage", _DIM_WHITE),
         ("", _DEFAULT_COLOR),
     ]
     print_box(lines, border_color=_BRIGHT_RED)
@@ -808,13 +679,13 @@ def _pause() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Detect PE injection via Windows Prefetch analysis"
+        description="Triage Prefetch anomalies and exported Sysmon evidence (not proof of compromise)"
     )
     parser.add_argument(
         "--prefetch-dir",
         type=str,
-        default=str(PREFETCH_DIR),
-        help="Path to the Prefetch directory",
+        default=None,
+        help="Path to Prefetch evidence (defaults to local Windows Prefetch unless --sysmon-xml is used)",
     )
     parser.add_argument(  # type: ignore[func-returns-value]
         "--all",
@@ -837,47 +708,55 @@ def main() -> None:
         action="store_true",
         help="Disable the pause at the end of execution",
     )
+    parser.add_argument("--sysmon-xml", help="Read an existing Sysmon XML export; never installs or configures Sysmon")
     args = parser.parse_args()
 
     if not args.no_banner:
         display_banner()
 
-    if sys.platform != "win32":
-        cprint("This tool requires Windows.", _BRIGHT_RED)
-        sys.exit(1)
-
-    if not is_admin():
+    if sys.platform == "win32" and not is_admin():
         cprint(
             "  !  Not running as administrator. Some prefetch files may be inaccessible.\n",
             _BRIGHT_YELLOW,
         )
 
-    prefetch_path = Path(args.prefetch_dir)
-    if not prefetch_path.exists():
-        cprint(f"  Prefetch directory not found: {prefetch_path}", _BRIGHT_RED)
+    prefetch_path = Path(args.prefetch_dir) if args.prefetch_dir else PREFETCH_DIR
+    scan_prefetch = args.prefetch_dir is not None or not args.sysmon_xml
+    issues = []
+    entries, findings = [], []
+    try:
+        if scan_prefetch and prefetch_path.is_dir():
+            entries, findings = scan_prefetch_directory(prefetch_path, issues)
+        elif scan_prefetch:
+            raise OSError(f"Prefetch directory not found: {prefetch_path}")
+        sysmon = None
+        if args.sysmon_xml:
+            from sysmon_evidence import analyze_sysmon_xml
+            sysmon = analyze_sysmon_xml(Path(args.sysmon_xml))
+        render_findings(findings)
+        render_summary(entries, findings)
+        cprint(LIMITATION, _BRIGHT_YELLOW)
+        for issue in issues:
+            cprint(f"Not analyzed: {issue['source_path']}: {issue['error']}", _BRIGHT_YELLOW)
+        if sysmon is not None:
+            cprint(f"Sysmon: {len(sysmon['findings'])} evidence finding(s), {len(sysmon['issues'])} issue(s)")
+            for finding in sysmon["findings"]:
+                cprint(f"  {finding['severity']} event {finding['event_id']}, record {finding['record_id']}: {finding['reason']}")
+        if args.all:
+            render_all_entries(entries, {f.entry.filename for f in findings})
+        if args.export:
+            export_results(entries, findings, args.export, issues, sysmon)
+    except (OSError, ValueError) as exc:
+        cprint(f"Scan failed: {exc}", _BRIGHT_RED)
         sys.exit(1)
-
-    entries, findings = scan_prefetch_directory(prefetch_path)
-
-    if not entries:
-        cprint("  No prefetch files could be parsed.", _BRIGHT_YELLOW)
-        sys.exit(0)
-
-    print()
-    render_findings(findings)
-    print()
-    render_summary(entries, findings)
-
-    if args.all:
-        print()
-        flagged = {f.entry.filename for f in findings}
-        render_all_entries(entries, flagged)
-
-    if args.export:
-        export_results(entries, findings, args.export)
+    if issues or (sysmon and sysmon["issues"]):
+        sys.exit(2)
+    if not entries and not sysmon:
+        cprint("No supported evidence was analyzed.", _BRIGHT_YELLOW)
+        sys.exit(2)
 
     print()
-    if not args.no_pause:
+    if not args.no_pause and sys.stdin.isatty():
         _pause()
 
 
